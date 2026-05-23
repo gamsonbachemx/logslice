@@ -1,81 +1,84 @@
-package cli
+package cli_test
 
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
+
+	"github.com/yourorg/logslice/internal/cli"
 )
 
-func newTestServer(lines []string) *httptest.Server {
+func newTestServer(lines []map[string]any) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		for _, l := range lines {
-			fmt.Fprintln(w, l)
+			b, _ := json.Marshal(l)
+			fmt.Fprintf(w, "%s\n", b)
 		}
 	}))
 }
 
 func TestRunMissingURL(t *testing.T) {
-	err := Run([]string{})
-	if err == nil || !strings.Contains(err.Error(), "--url is required") {
-		t.Fatalf("expected url-required error, got %v", err)
+	var out, errBuf bytes.Buffer
+	code := cli.Run([]string{}, &out, &errBuf)
+	if code != 2 {
+		t.Errorf("want exit 2, got %d", code)
+	}
+	if !strings.Contains(errBuf.String(), "--url") {
+		t.Errorf("expected --url mention in stderr: %q", errBuf.String())
 	}
 }
 
 func TestRunInvalidFlag(t *testing.T) {
-	err := Run([]string{"--unknown-flag"})
-	if err == nil {
-		t.Fatal("expected error for unknown flag")
+	var out, errBuf bytes.Buffer
+	code := cli.Run([]string{"--notaflag"}, &out, &errBuf)
+	if code != 2 {
+		t.Errorf("want exit 2, got %d", code)
 	}
 }
 
 func TestParseFlagsDefaults(t *testing.T) {
-	cfg, err := parseFlags([]string{"--url", "http://example.com"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	var out, errBuf bytes.Buffer
+	server := newTestServer([]map[string]any{
+		{"msg": "hello", "time": "2024-01-01T00:00:00Z"},
+	})
+	defer server.Close()
+
+	code := cli.Run([]string{"--url", server.URL}, &out, &errBuf)
+	if code != 0 {
+		t.Errorf("want exit 0, got %d; stderr: %s", code, errBuf.String())
 	}
-	if cfg.Pretty {
-		t.Error("expected pretty=false by default")
-	}
-	if cfg.Timeout != 30*time.Second {
-		t.Errorf("expected 30s timeout, got %v", cfg.Timeout)
-	}
-	if cfg.Pattern != "" {
-		t.Error("expected empty pattern by default")
+	if !strings.Contains(out.String(), "hello") {
+		t.Errorf("expected 'hello' in output: %q", out.String())
 	}
 }
 
 func TestStreamFiltersAndWrites(t *testing.T) {
-	entry := map[string]interface{}{
-		"time":    time.Now().UTC().Format(time.RFC3339),
-		"level":   "info",
-		"message": "hello world",
+	var out, errBuf bytes.Buffer
+	server := newTestServer([]map[string]any{
+		{"msg": "match this", "time": "2024-06-01T10:00:00Z"},
+		{"msg": "ignore me", "time": "2024-06-01T11:00:00Z"},
+	})
+	defer server.Close()
+
+	code := cli.Run([]string{
+		"--url", server.URL,
+		"--pattern", "match",
+	}, &out, &errBuf)
+
+	if code != 0 {
+		t.Errorf("want exit 0, got %d; stderr: %s", code, errBuf.String())
 	}
-	raw, _ := json.Marshal(entry)
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write(raw)
-		w.Write([]byte("\n"))
-		w.Write([]byte("not json\n"))
-	}))
-	defer srv.Close()
-
-	var buf bytes.Buffer
-	cfg := &Config{
-		URL:     srv.URL,
-		Pattern: "hello",
-		Timeout: 5 * time.Second,
-		Out:     &buf,
+	if !strings.Contains(out.String(), "match this") {
+		t.Errorf("expected 'match this' in output: %q", out.String())
 	}
-
-	if err := stream(cfg); err != nil {
-		t.Fatalf("stream error: %v", err)
+	if strings.Contains(out.String(), "ignore me") {
+		t.Errorf("did not expect 'ignore me' in output: %q", out.String())
 	}
-
-	if !strings.Contains(buf.String(), "hello world") {
-		t.Errorf("expected output to contain 'hello world', got: %s", buf.String())
+	if !strings.Contains(errBuf.String(), "matched=1") {
+		t.Errorf("expected stats in stderr: %q", errBuf.String())
 	}
 }
