@@ -1,4 +1,4 @@
-// Package output handles formatting and writing of filtered log entries.
+// Package output handles writing filtered log lines to an io.Writer.
 package output
 
 import (
@@ -6,75 +6,77 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"time"
+	"strings"
+
+	"github.com/yourorg/logslice/internal/highlight"
 )
 
-// Format represents the output format for log entries.
-type Format string
+// Format controls how log lines are rendered.
+type Format int
 
 const (
-	// FormatJSON outputs raw JSON lines.
-	FormatJSON Format = "json"
-	// FormatPretty outputs human-readable formatted lines.
-	FormatPretty Format = "pretty"
+	FormatJSON   Format = iota // raw JSON, one line per record
+	FormatPretty               // human-readable key=value pairs
 )
 
-// Writer writes log entries to an output destination.
+// Writer writes log lines to an underlying io.Writer.
 type Writer struct {
-	dest   io.Writer
-	format Format
+	out         io.Writer
+	format      Format
+	highlighter *highlight.Highlighter
 }
 
-// NewWriter creates a new Writer with the given destination and format.
-// If dest is nil, os.Stdout is used.
-func NewWriter(dest io.Writer, format Format) *Writer {
-	if dest == nil {
-		dest = os.Stdout
-	}
-	if format == "" {
-		format = FormatJSON
-	}
-	return &Writer{dest: dest, format: format}
+// Options configures a Writer.
+type Options struct {
+	Format      Format
+	Pattern     string // regex to highlight in output (empty = no highlight)
+	ColorOutput bool   // enable ANSI colors
 }
 
-// WriteLine writes a single parsed log entry to the destination.
-func (w *Writer) WriteLine(entry map[string]interface{}) error {
+// NewWriter returns a Writer with the given options.
+// If out is nil, os.Stdout is used.
+func NewWriter(out io.Writer, opts Options) (*Writer, error) {
+	if out == nil {
+		out = os.Stdout
+	}
+	h, err := highlight.New(opts.Pattern, highlight.Cyan, opts.ColorOutput)
+	if err != nil {
+		return nil, fmt.Errorf("highlight pattern: %w", err)
+	}
+	return &Writer{out: out, format: opts.Format, highlighter: h}, nil
+}
+
+// WriteLine writes a single parsed log record to the underlying writer.
+// raw is the original JSON bytes; fields is the decoded map.
+func (w *Writer) WriteLine(raw []byte, fields map[string]any) error {
+	var line string
 	switch w.format {
 	case FormatPretty:
-		return w.writePretty(entry)
+		line = w.pretty(fields)
 	default:
-		return w.writeJSON(entry)
+		line = string(raw)
 	}
-}
-
-func (w *Writer) writeJSON(entry map[string]interface{}) error {
-	data, err := json.Marshal(entry)
-	if err != nil {
-		return fmt.Errorf("output: marshal error: %w", err)
-	}
-	_, err = fmt.Fprintf(w.dest, "%s\n", data)
+	line = w.highlighter.Apply(line)
+	_, err := fmt.Fprintln(w.out, line)
 	return err
 }
 
-func (w *Writer) writePretty(entry map[string]interface{}) error {
-	timestamp := ""
-	if ts, ok := entry["time"]; ok {
-		if tsStr, ok := ts.(string); ok {
-			if t, err := time.Parse(time.RFC3339, tsStr); err == nil {
-				timestamp = t.Format("2006-01-02 15:04:05")
-			}
+// pretty renders fields as a space-separated key=value string.
+// The "msg" or "message" field is printed first when present.
+func (w *Writer) pretty(fields map[string]any) string {
+	var sb strings.Builder
+	for _, key := range []string{"msg", "message"} {
+		if v, ok := fields[key]; ok {
+			fmt.Fprintf(&sb, "%s ", v)
+			break
 		}
 	}
-	level := ""
-	if l, ok := entry["level"]; ok {
-		level = fmt.Sprintf("[%v]", l)
+	for k, v := range fields {
+		if k == "msg" || k == "message" {
+			continue
+		}
+		b, _ := json.Marshal(v)
+		fmt.Fprintf(&sb, "%s=%s ", k, string(b))
 	}
-	message := ""
-	if m, ok := entry["message"]; ok {
-		message = fmt.Sprintf("%v", m)
-	} else if m, ok := entry["msg"]; ok {
-		message = fmt.Sprintf("%v", m)
-	}
-	_, err := fmt.Fprintf(w.dest, "%s %s %s\n", timestamp, level, message)
-	return err
+	return strings.TrimSpace(sb.String())
 }
